@@ -1,4 +1,7 @@
-<<FiniteMapping`
+BeginPackage["GridData`", {"FiniteMapping`", "paul`", "numerics`"}]
+
+ClearAll["GridData*", "GD*"]
+
 (* -- Purpose -- *)
 (*
 Store immutable data associated with positions on a uniform grid.
@@ -24,12 +27,12 @@ hash-indexed collection (vector, list), expression used to store data (by positi
 - support copying/moving regions around
 - support densifying
 - detect and report repeated variable names and other errors
-
 - detect when the grid is dense
-- and or allow efficient dense indexing of small neighborhoods (for optimization objective functions)
+- allow efficient dense indexing of small neighborhoods (e.g. for objective functions in optimizations, convolutions, filtering etc.)
 - treat the case of NumericVector valued data (i.e. a list of floats) specially
  ^ consider implementing it as if this where the case even for differently nested lists (
  e.g. data of the form { {nx, nx}, d, {r,g,b}} or even with a matrix
+- investigate how Association and or Dataset perform with these tasks
 *)
 
 (* -- Purpose -- *)
@@ -40,9 +43,11 @@ Store immutable data associated with positions on a uniform grid.
 (* Implementation notes *)
 (* Valid forms are:
 GridData[dataNames_List, f_FiniteMapping]
- f maps coordinates to points, on each point we store a list of values of length
- dataNames, which are associated with these names in their given order
+ f maps coordinates to a list of values of length
+ dataNames, which are associated with dataNames in their given order
 
+ Conceptually, we have a FinteMapping that creates a finite mapping at each point.
+ We just don't store the keys (that are shared!) on each inner finite mapping.
 
  TODO use custom structure to optimize expected queries
  TODO store more data to correct user errors
@@ -119,6 +124,10 @@ GridDataMakeFromArrays[dataNames_List, arrays : {__}, level_Integer] /;
     AllTrue[arrays, IsArrayAtLevel[#, level]&] && AllEqual[arrays, Dimensions[#][[;;level]] &]:=
     GridDataMakeFromArray[dataNames, ArrayInterleave[arrays, level+1], level];
 
+
+GridDataMakeFromArrays[arrays : {__}, level_Integer] :=
+    GridDataMakeFromArrays[FMMakeListDomainNames[Length@arrays], arrays, level];
+
 (* -- Purpose -- *)
 (*
 Make a dense grid of data from sampling a function on some uniform grid
@@ -143,7 +152,7 @@ GridDataMakeFromRules[
     _[_(*position*) , {__} (*values)*)]
    ...
   ]
-] := {f=FiniteMappingMakeFromRules@rules}~With~GridData[dataNames, f];
+] /; AllTrue[rules, Length@dataNames === Length@Last@# &] := {f=FiniteMappingMakeFromRules@rules}~With~GridData[dataNames, f];
 
 
 GridDataMakeFromRules[
@@ -151,7 +160,7 @@ GridDataMakeFromRules[
     _[_(*position*) , {__} (*values)*)]
         ...
   ]
-] := rules ~ GridDataMakeFromRules~ FMMakeListDomainNames@Length@Last@First@rules
+] := FMMakeListDomainNames@Length@Last@First@rules ~ GridDataMakeFromRules~ rules
 
 
 (* -- Purpose -- *)
@@ -174,30 +183,42 @@ CoordinateBounds
 Convert back to a (dense) array by subsampling at each valid point
 *)
 (* TODO works only for data of type {__?NumericQ} *)
-GDToArray[GridData[dataNames_List, f_FiniteMapping], extractedDataNames_List] := Module[{
+(* TODO works only for positive coordinates, creates large holes/borders when coordinates are large positive numbers
+  -> cut out only the GDCoodinateBounds, Lookup each value, use a given default*)
+(* What should we do with missing data? :> default value*)
+GDToArray[g : GridData[dataNames_List, f_FiniteMapping], extractedDataNames_List] := Module[{
   extractedPositions = Positions[dataNames, extractedDataNames]
+  , mincb = First/@GDCoordinateBounds@g
+  , toArrayPosition
 },
-
+  toArrayPosition[p_] := (p - mincb) + 1;
   SparseArray@Flatten@Cases[f // FMAsRules,
     _[position_, values_] :>
-        MapIndexed[position~Append~First@#2 -> #1 &,
+        MapIndexed[toArrayPosition@position~Append~First@#2 -> #1 &,
           values[[extractedPositions]]
         ]
     ]
 ];
 
+ClearAll@GDSingleDatumToArray
+
 (* TODO only works with single number or vector valued attributes *)
-GDToArray[GridData[dataNames_List, f_FiniteMapping], extractedDataName_] := Module[{
+(* TODO this will conflict with the above for List type variable names, which are standard. Use another name:
+no need for usability shortcuts at this stage*)
+GDSingleDatumToArray[g : GridData[dataNames_List, f_FiniteMapping], extractedDataName_] := Module[{
   extractedPosition = First@First@Position[dataNames, extractedDataName]
+  , mincb = First/@ GDCoordinateBounds@g
+  , toArrayPosition
 },
+  toArrayPosition[p_] := (p - mincb) + 1;
 
   SparseArray@Flatten@Cases[f // FMAsRules,
     _[position_, values_] :>
         If[ListQ@values[[extractedPosition]],
-          MapIndexed[position~Append~First@#2 -> #1 &,
+          MapIndexed[toArrayPosition@position~Append~First@#2 -> #1 &,
             values[[extractedPosition]]
           ]
-          ,{position->values[[extractedPosition]]}
+          ,{toArrayPosition@position->values[[extractedPosition]]}
           ]
   ]
 ];
@@ -205,24 +226,29 @@ GDToArray[GridData[dataNames_List, f_FiniteMapping], extractedDataName_] := Modu
 (* note that the coordinates will change, arrays only support 1-based positve indexing *)
 GDToArray[g_GridData] := GDToArray[g, GDDataNames@g]
 
-GDToArrays;
 
+(* TODO should this return a SparseArray or a dense on with the default already inserted?
+Can Sparse Array support lists as data? *)
 
 (* -- Purpose -- *)
 (*
 Visualize data as an image.
 Assumes data at each point is a list of numbers, individual attributes are thus single numbers
 *)
-GDToImage[g : GridData[dataNames_List, f_FiniteMapping]] /;
-    {1,2,3,4}~MemberQ~Length@dataNames && GDArrayDepth@g == 2 :=
+GDToImage[g_GridData] /;
+    {1,2,3,4}~MemberQ~Length@GDDataNames@dataNames && GDArrayDepth@g == 2 :=
         Image[GDToArray[g], ColorSpace -> "RGB"] (* TODO unsparsify ? to array already does this*)
 
 
 GDToImage3D[g_GridData] /;
-    {1,2,3,4}~MemberQ~Length@dataNames && GDArrayDepth@g == 3 :=
+    {1,2,3,4}~MemberQ~Length@GDDataNames@dataNames && GDArrayDepth@g == 3 :=
         Image3D[GDToArray[g], ColorSpace -> "RGB"]
 
-(* Note that this loses dataNames *)
+(*
+Representation in the format expected by GridDataMakeFromRules
+
+Note that this loses dataNames
+*)
 GDAsRules[GridData[dataNames_List, f_FiniteMapping]] := FMAsRules@f
 
 (* rules of lists of rules,
@@ -258,6 +284,13 @@ GDAsPairedAtomRules[g : GridData[dataNames_List, f_FiniteMapping], pairing_ : Li
 (* same as GDToArrays, but keeps dataNames *)
 GDAsArraysRule[g : GridData[dataNames_List, f_FiniteMapping]] := Thread@Rule[dataNames,GDToArrays@g]
 
+(* -- Purpose -- *)
+(*
+Create a new gridData with data from g2 if present, defaulting to g1 data if missing there.
+*)
+(* TODO check compatibility *)
+GDUpdate[g1_GridData, g2_GridData] /; GDDataNames@g1 == GDDataNames@g2 && GDArrayDepth@g1 === GDArrayDepth@g2 :=
+    GridDataMakeFromRules[GDDataNames@g1, GDAsRules@g1 ~UpdateRuleList~ GDAsRules@g2];
 
 (* -- Purpose -- *)
 (*
@@ -271,8 +304,10 @@ GDArrayDepth[g : GridData[dataNames_List, f_FiniteMapping]] := Length@First@FMDo
 (*
 Create a non-interleaving array, where dataNames are equivalent to the outermost instead of the innermost indices.
 *)
-(*TODO*)
-GDToNoninterleavingArray
+(*TODO use GDToArray specifically made to extract only one attribute*)
+GDToNoninterleavingArray[g_GridData] := GDSingleDatumToArray[g, #] & /@ GDDataNames@g;
+
+GDToArrays = GDToNoninterleavingArray
 
 (* -- Purpose -- *)
 (*
@@ -296,19 +331,33 @@ GDDataNames[GridData[dataNames_List, f_FiniteMapping]] := dataNames;
 
 (* -- Purpose -- *)
 (*
+Determine whether an expression is possibly a valid coordinate of the grid g.
+
+For this, it must be a list of Integers and have Length = Array depth.
+*)
+GDCoordinateQ[g_GridData, c : {__Integer}] /; LengthQ[c, GDArrayDepth@g] = True;
+
+GDCoordinateQ[g_GridData, c_] = False;
+
+
+(* -- Purpose -- *)
+(*
 get data at point as FiniteMapping
 *)
 GDLookup[
-  g : GridData[dataNames_List, f_FiniteMapping]
+  g_GridData
   , position : {__Integer}
-] /; LengthQ[position, GDArrayDepth@g] := FiniteMappingMakeFromLists[dataNames, GDLookupList[g,position]]
+] /; g~GDCoordinateQ~position := FiniteMappingMakeFromLists[GDDataNames@g, GDLookupList[g,position]]
+
 (*
 get data at point as List in same order as DataNames
+
+This gives the RHS expected in the rule constructors
 *)
 GDLookupList[
   g : GridData[dataNames_List, f_FiniteMapping]
   , position : {__Integer}
-] /; LengthQ[position, GDArrayDepth@g]  := f~FMEvaluate~position
+] /; g~GDCoordinateQ~position  := f~FMEvaluate~position
 
 
 (* -- Purpose -- *)
@@ -390,13 +439,32 @@ GDMapPositions[g_, GridData[dataNames_List, f_FiniteMapping]] := GridDataMakeFro
 
 (*
   {position} -> {x0, position}
+
+  x0 defaults to 1
 *)
 GDPrependDimension[g_GridData, x0_Integer : 1] := GDMapPositions[#~Prepend~x0 &, g];
 
 (*
+  {x0, position} -> {position}
+
+  Warning: Repeated keys might arise when there is more than one x0.
+  Consider selecting first.
+*)
+GDRestDimension[g_GridData] := GDMapPositions[Rest, g];
+
+
+(*
   {position} -> {position, x0}
+
+    x0 defaults to 1
 *)
 GDAppendDimension[g_GridData, x0_Integer : 1] := GDMapPositions[#~Append~x0 &, g];
+
+(*
+  {position, x0} -> {position}
+*)
+GDMostDimension[g_GridData] := GDMapPositions[Most, g];
+
 
 (* -- Purpose -- *)
 (*
@@ -442,6 +510,32 @@ to the data from both at each point.
 TODO What do we do with points defined in one grid and not the other? Pass Missing[position]?
 *)
 
+
+(* -- Purpose -- *)
+(*
+Create a new grid that has the
+
+The behaviour is undefined if the source and destination regions overlap.
+*)
+GDCopy[g_GridData,
+  pastePositionOffset : {__Integer}] /;
+    g~GDCoordinateQ~pastePositionOffset := GDCopy[g, GDCoordinateBounds@g, pastePositionOffset];
+
+GDCopy[g_GridData,
+  srcCoordinateBounds : {{_Integer, _Integer} ..},
+  pastePositionOffset : {__Integer}] /;
+    g~GDCoordinateQ~pastePositionOffset := GDCopy[g, FlatCoordinateBoundsArray@srcCoordinateBounds, pastePositionOffset]
+
+GDCopy[g_GridData,
+  srcCoordinates : {{__Integer} ..},
+  pastePositionOffset : {__Integer}] /;
+    g~GDCoordinateQ~pastePositionOffset := GridDataMakeFromRules[
+      GDDataNames@g,
+      GDAsRules[g]~Join~
+          (#+pastePositionOffset -> GDLookupList[g, #] & /@ srcCoordinates)
+  ]
+
+
 (* -- Purpose -- *)
 (*
 Extend the existing data to fill the whole region specified by newBounds,
@@ -460,7 +554,7 @@ GDNearestFilter[g_GridData,
   newCoordinateBoundsArrayParam : {{_Integer, _Integer} ..}] /;
     Length@newCoordinateBoundsArrayParam == GDArrayDepth@g :=
     GDNearestFilter[g,
-      CoordinateBoundsArray@newCoordinateBoundsArrayParam ~Level~{-2} (* TODO this is pretty inefficient, use an iterator *)
+      FlatCoordinateBoundsArray@newCoordinateBoundsArrayParam (* TODO creating this explicitly is pretty inefficient, use an iterator *)
     ];
 
 
