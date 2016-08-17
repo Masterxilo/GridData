@@ -314,6 +314,7 @@ CoordinateBounds
 DefinePublicFunction[
 
   GDToArray[g : GridData[dataNames_List, f_FiniteMapping], extractedDataNames_List]
+  /; GDDataNames@g~ContainsAll~extractedDataNames
 
   ,"Convert back to a (dense) array by subsampling at each valid point"
 
@@ -341,6 +342,7 @@ no need for usability shortcuts at this stage*)
 
 DefinePublicFunction[
 GDSingleDatumToArray[g : GridData[dataNames_List, f_FiniteMapping], extractedDataName_]
+  /; GDDataNames@g~Contains~extractedDataName
   ,"for a single dataName"
   ,Module[{
     extractedPosition = First@First@Position[dataNames, extractedDataName]
